@@ -1,0 +1,14 @@
+# Generated outputs
+out/
+refresh-demo.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Logs
+*.log
