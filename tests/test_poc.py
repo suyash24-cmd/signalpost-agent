@@ -28,6 +28,21 @@ from norway_company_agent.external_footprint import aggregate_footprint, publish
 from norway_company_agent.external_tasks import plan_external_tasks  # noqa: E402
 from norway_company_agent.external_control import development_score, run_company_control, strategy_order  # noqa: E402
 from norway_company_agent.identity import apply_website_identity_gate, assess_social_identity, assess_website_identity  # noqa: E402
+from norway_company_agent.identity_triangulation import (  # noqa: E402
+    AMBIGUOUS,
+    EXACT,
+    IDENTITY_DECISIONS,
+    MISMATCHED,
+    UNVERIFIED,
+    address_support,
+    canonical_identity_from_profile,
+    canonical_identity_from_task,
+    name_match,
+    normalized_domain,
+    resolve_candidate_identities,
+    same_site,
+    triangulate_identity,
+)
 from norway_company_agent.website import _extraction_state, _priority_links, _social_links, assert_public_url, normalize_homepage, normalize_social_url, structured_social_links  # noqa: E402
 from norway_company_agent.batch import evidence_terminal_state, profile_complete_for_modules, read_organisation_inputs, terminal_envelope, validate_envelopes  # noqa: E402
 from norway_company_agent.snapshots import SnapshotFetcher  # noqa: E402
@@ -41,6 +56,8 @@ from norway_company_agent.connectors.base import (  # noqa: E402
     FAILURE_UNKNOWN_CONNECTOR,
     FAILURE_UNSUPPORTED_ACQUISITION_MODE,
     FAILURE_UNSUPPORTED_TASK_TYPE,
+    BaseConnector,
+    ConnectorResult,
 )
 from norway_company_agent.connectors.budget import RequestBudget  # noqa: E402
 from norway_company_agent.connectors.executor import STAGE_ACQUISITION_GATE, STAGE_ESTIMATE_COERCION, STAGE_EXECUTION, STAGE_REQUEST_ESTIMATION, STAGE_RIGHTS_GATE, STAGE_SUPPORT_CHECK, STAGE_TASK_VALIDATION, run_external_step, run_external_tasks  # noqa: E402
@@ -1849,6 +1866,401 @@ class ExternalStepTerminalGateTests(unittest.TestCase):
         self.assertEqual({item["connector"] for item in step["rejections"]}, {"google_places_api", "licensed_news_search", "jobs_provider", "permitted_search_api"})
         envelope = terminal_envelope(profile, run_id="test-run", modules=sorted(profile.get("evidence", {})), started_at=self.now, completed_at=self.now)
         self.assertNotIn("https://example.test/places/123456789", json.dumps(envelope, ensure_ascii=False))
+
+
+class IdentityTriangulationTests(unittest.TestCase):
+    """Phase 2: an external candidate must be tied to the exact target, not merely similar."""
+
+    target = {
+        "organisation_number": "923609016",
+        "name": "Nordic Signal AS",
+        "domain": "example.no",
+        "address": {"street": "Karl Johans gate 1", "postcode": "0159", "city": "Oslo", "municipality": "Oslo"},
+        "municipality": "Oslo",
+    }
+
+    def decide(self, candidate, target=None):
+        return triangulate_identity(self.target if target is None else target, candidate)
+
+    def test_all_four_decision_states_exist(self):
+        self.assertEqual(IDENTITY_DECISIONS, (EXACT, AMBIGUOUS, MISMATCHED, UNVERIFIED))
+
+    def test_foreign_organisation_number_is_mismatched_and_can_never_publish(self):
+        for declared in ("111222333", "923609017", "999999999"):
+            with self.subTest(declared=declared):
+                decision = self.decide(
+                    {
+                        "organisation_number": declared,
+                        "name": "Nordic Signal AS",
+                        "source_url": "https://example.no/about",
+                        "address": "Karl Johans gate 1, 0159 Oslo",
+                    }
+                )
+                self.assertEqual(decision["status"], MISMATCHED)
+                self.assertFalse(decision["publishable"])
+
+    def test_organisation_number_conflict_is_symmetric(self):
+        decision = triangulate_identity(
+            {"organisation_number": "111222333", "name": "Nordic Signal AS", "domain": "example.no"},
+            {"organisation_number": "923609016", "source_url": "https://example.no/"},
+        )
+        self.assertEqual(decision["status"], MISMATCHED)
+        self.assertFalse(decision["publishable"])
+
+    def test_matching_organisation_number_is_the_canonical_anchor(self):
+        decision = self.decide({"organisation_number": "923609016"})
+        self.assertEqual(decision["status"], EXACT)
+        self.assertTrue(decision["publishable"])
+        self.assertTrue(decision["signals"]["organisation_number_match"])
+
+    def test_exact_name_and_domain_match_verifies_the_exact_entity(self):
+        decision = self.decide({"name": "NORDIC SIGNAL AS", "source_url": "https://example.no/"})
+        self.assertEqual(decision["status"], EXACT)
+        self.assertTrue(decision["publishable"])
+        self.assertTrue(decision["signals"]["name_exact"])
+        self.assertTrue(decision["signals"]["domain_match"])
+
+    def test_exact_name_domain_and_address_all_match_verifies(self):
+        decision = self.decide(
+            {"name": "Nordic Signal AS", "source_url": "https://example.no/about", "address": "Karl Johans gate 1, 0159 Oslo"}
+        )
+        self.assertEqual(decision["status"], EXACT)
+        self.assertTrue(decision["signals"]["address_support"]["supported"])
+
+    def test_exact_domain_match_is_supporting_evidence_not_a_verdict(self):
+        decision = self.decide({"source_url": "https://shop.example.no/products"})
+        self.assertTrue(decision["signals"]["domain_match"])
+        self.assertEqual(decision["status"], AMBIGUOUS)
+        self.assertFalse(decision["publishable"])
+
+    def test_name_match_alone_never_publishes(self):
+        decision = self.decide({"name": "Nordic Signal AS"})
+        self.assertEqual(decision["status"], AMBIGUOUS)
+        self.assertFalse(decision["publishable"])
+
+    def test_same_name_with_a_different_domain_cannot_establish_identity(self):
+        decision = self.decide({"name": "Nordic Signal AS", "source_url": "https://example-other.no/"})
+        self.assertEqual(decision["status"], AMBIGUOUS)
+        self.assertFalse(decision["publishable"])
+
+    def test_same_name_with_a_different_domain_and_matching_address_cannot_establish_identity(self):
+        decision = self.decide(
+            {"name": "Nordic Signal AS", "source_url": "https://example-other.no/", "address": "Karl Johans gate 1, 0159 Oslo"}
+        )
+        self.assertEqual(decision["status"], AMBIGUOUS)
+        self.assertFalse(decision["publishable"])
+
+    def test_address_match_alone_never_establishes_exact_identity(self):
+        decision = self.decide({"address": "Karl Johans gate 1, 0159 Oslo"})
+        self.assertTrue(decision["signals"]["address_support"]["supported"])
+        self.assertEqual(decision["status"], UNVERIFIED)
+        self.assertFalse(decision["publishable"])
+
+    def test_name_plus_shared_address_is_ambiguous_not_exact(self):
+        decision = self.decide({"name": "Nordic Signal AS", "address": "Karl Johans gate 1, 0159 Oslo"})
+        self.assertEqual(decision["status"], AMBIGUOUS)
+        self.assertFalse(decision["publishable"])
+
+    def test_two_distinct_verified_candidates_resolve_to_ambiguous_and_publish_nothing(self):
+        candidates = [
+            {"organisation_number": "923609016", "source_url": "https://example.no/"},
+            {"name": "Nordic Signal AS", "source_url": "https://example.no/about"},
+        ]
+        decisions = resolve_candidate_identities(self.target, candidates)
+        self.assertEqual([item["status"] for item in decisions], [AMBIGUOUS, AMBIGUOUS])
+        self.assertFalse(any(item["publishable"] for item in decisions))
+
+    def test_duplicate_records_of_a_single_identity_stay_exact(self):
+        candidates = [
+            {"name": "Nordic Signal AS", "source_url": "https://example.no/"},
+            {"name": "Nordic Signal AS", "source_url": "https://example.no/about?utm_source=x"},
+        ]
+        decisions = resolve_candidate_identities(self.target, candidates)
+        self.assertEqual([item["status"] for item in decisions], [EXACT, EXACT])
+
+    def test_decision_is_deterministic(self):
+        candidate = {"name": "Nordic Signal AS", "source_url": "https://example.no/"}
+        self.assertEqual(self.decide(candidate), self.decide(candidate))
+
+    def test_generic_legal_name_with_only_a_shared_address_stays_ambiguous(self):
+        target = {
+            "organisation_number": "923609016",
+            "name": "Eiendom AS",
+            "domain": "eiendom-example.no",
+            "address": {"street": "Karl Johans gate 1", "postcode": "0159", "city": "Oslo", "municipality": "Oslo"},
+        }
+        decision = triangulate_identity(target, {"name": "Eiendom AS", "address": "Karl Johans gate 1, 0159 Oslo"})
+        self.assertFalse(decision["publishable"])
+        self.assertIn(decision["status"], (AMBIGUOUS, UNVERIFIED))
+
+
+class IdentityTriangulationAdversarialTests(unittest.TestCase):
+    """Phase 2: deceptive URLs, lookalike domains and malformed evidence must abstain."""
+
+    def test_lookalike_domain_is_never_the_same_site(self):
+        for deceptive in ("example-other.no", "notexample.no", "example.no.evil.com", "myexample.no", "xexample.no"):
+            with self.subTest(host=deceptive):
+                self.assertFalse(same_site(deceptive, "example.no"))
+                decision = triangulate_identity(
+                    {"organisation_number": "", "name": "Nordic Signal AS", "domain": "example.no"},
+                    {"name": "Nordic Signal AS", "source_url": f"https://{deceptive}/"},
+                )
+                self.assertFalse(decision["publishable"])
+
+    def test_a_real_subdomain_is_the_same_site(self):
+        for host in ("shop.example.no", "www.example.no", "a.b.example.no"):
+            with self.subTest(host=host):
+                self.assertTrue(same_site(host, "example.no"))
+
+    def test_url_normalization_is_strict_but_host_exact(self):
+        for messy in (
+            "https://WWW.Example.NO.:8443/a/b?c=1#d",
+            "http://www.example.no",
+            "example.no.",
+            "https://example.no/path",
+            "HTTPS://WWW.EXAMPLE.NO",
+        ):
+            with self.subTest(url=messy):
+                self.assertEqual(normalized_domain(messy), "example.no")
+
+    def test_userinfo_and_query_tricks_cannot_impersonate_the_target_domain(self):
+        for trick in ("https://example.no@evil.com/", "https://evil.com/?ref=example.no", "https://evil.com/example.no"):
+            with self.subTest(url=trick):
+                self.assertNotEqual(normalized_domain(trick), "example.no")
+                decision = triangulate_identity(
+                    {"organisation_number": "", "name": "Nordic Signal AS", "domain": "example.no"},
+                    {"name": "Nordic Signal AS", "source_url": trick},
+                )
+                self.assertFalse(decision["publishable"])
+
+    def test_norwegian_characters_fold_to_the_same_legal_name(self):
+        exact, score = name_match("Blåbærsyltetøy AS", "BLABAERSYLTETOY AS")
+        self.assertTrue(exact)
+        self.assertEqual(score, 1.0)
+        decision = triangulate_identity(
+            {"organisation_number": "", "name": "Blåbærsyltetøy AS", "domain": "example.no"},
+            {"name": "Blåbærsyltetøy AS", "source_url": "https://example.no/"},
+        )
+        self.assertEqual(decision["status"], EXACT)
+
+    def test_a_near_miss_name_is_not_an_exact_name(self):
+        exact, _ = name_match("Nordic Signal AS", "Nordic Signalgruppen AS")
+        self.assertFalse(exact)
+
+    def test_formatted_organisation_numbers_abstain_instead_of_guessing(self):
+        for declared in ("923 609 016", "923-609-016", "923.609.016", "0923609016"):
+            with self.subTest(declared=declared):
+                decision = triangulate_identity(
+                    {"organisation_number": "923609016", "name": "Nordic Signal AS", "domain": ""},
+                    {"organisation_number": declared, "name": "Nordic Signal AS"},
+                )
+                self.assertFalse(decision["publishable"])
+                self.assertEqual(decision["status"], MISMATCHED)
+
+    def test_an_integer_organisation_number_still_matches_exactly(self):
+        decision = triangulate_identity(
+            {"organisation_number": "923609016", "name": "Nordic Signal AS", "domain": ""},
+            {"organisation_number": 923609016, "name": "Someone Else AS"},
+        )
+        self.assertEqual(decision["status"], EXACT)
+
+    def test_candidate_with_no_identity_signal_is_unverified(self):
+        decision = triangulate_identity(
+            {"organisation_number": "923609016", "name": "Nordic Signal AS", "domain": "example.no"},
+            {"source_url": "https://www.linkedin.com/company/somebody-else"},
+        )
+        self.assertEqual(decision["status"], UNVERIFIED)
+        self.assertFalse(decision["publishable"])
+
+    def test_empty_target_identity_cannot_resolve_a_candidate(self):
+        decision = triangulate_identity({}, {"name": "Nordic Signal AS", "source_url": "https://example.no/"})
+        self.assertFalse(decision["publishable"])
+        self.assertIn(decision["status"], (AMBIGUOUS, UNVERIFIED))
+
+    def test_malformed_candidates_do_not_raise(self):
+        for candidate in ({}, {"organisation_number": None}, {"name": None}, {"address": 17}, None, "string"):
+            with self.subTest(candidate=candidate):
+                decision = triangulate_identity(
+                    {"organisation_number": "923609016", "name": "Nordic Signal AS", "domain": "example.no"}, candidate
+                )
+                self.assertFalse(decision["publishable"])
+
+    def test_a_declared_conflicting_municipality_blocks_an_org_less_candidate(self):
+        decision = triangulate_identity(
+            {"organisation_number": "", "name": "Nordic Signal AS", "domain": "example.no", "municipality": "Oslo"},
+            {"name": "Nordic Signal AS", "municipality": "Bergen"},
+        )
+        self.assertTrue(decision["signals"]["municipality_conflict"])
+        self.assertFalse(decision["publishable"])
+
+
+class IdentityTargetIdentityExtractionTests(unittest.TestCase):
+    """Phase 2: the target identity comes from official records, never from a crawl alone."""
+
+    def profile(self, **overrides):
+        profile = {
+            "organisation_number": "923609016",
+            "name": "Nordic Signal AS",
+            "evidence": {
+                "registry_live": {
+                    "value": {
+                        "business_address": {
+                            "adresse": "Karl Johans gate 1",
+                            "postnummer": "0159",
+                            "poststed": "Oslo",
+                            "kommune": "Oslo",
+                        },
+                        "website": "https://www.example.no/",
+                    }
+                },
+            },
+        }
+        profile.update(overrides)
+        return profile
+
+    def test_target_identity_uses_the_official_registered_website(self):
+        identity = canonical_identity_from_profile(self.profile())
+        self.assertEqual(identity["organisation_number"], "923609016")
+        self.assertEqual(identity["name"], "Nordic Signal AS")
+        self.assertEqual(identity["domain"], "example.no")
+        self.assertEqual(identity["address"]["postcode"], "0159")
+        self.assertEqual(identity["municipality"], "Oslo")
+
+    def test_a_quarantined_website_can_never_become_an_identity_anchor(self):
+        profile = self.profile()
+        profile["evidence"]["registry_live"]["value"]["website"] = ""
+        profile["evidence"]["website"] = {
+            "status": "available",
+            "value": {
+                "final_url": "https://impostor-example.net/",
+                "identity_assessment": {"status": "related_or_uncertain", "publishable": False},
+            },
+        }
+        self.assertEqual(canonical_identity_from_profile(profile)["domain"], "")
+
+    def test_a_publishable_website_supplies_the_domain_when_the_registry_has_none(self):
+        profile = self.profile()
+        profile["evidence"]["registry_live"]["value"]["website"] = ""
+        profile["evidence"]["website"] = {
+            "status": "available",
+            "value": {
+                "final_url": "https://www.example.no/about",
+                "identity_assessment": {"status": "exact", "publishable": True},
+            },
+        }
+        self.assertEqual(canonical_identity_from_profile(profile)["domain"], "example.no")
+
+    def test_flattened_address_keys_are_understood(self):
+        target = canonical_identity_from_task(
+            {
+                "organisation_number": "923609016",
+                "company_name": "Nordic Signal AS",
+                "target_identity": {"address": {"forretningsadresse.adresse": "Karl Johans gate 1", "forretningsadresse.postnummer": "0159"}},
+            }
+        )
+        support = address_support(target["address"], "Karl Johans gate 1, 0159 Oslo")
+        self.assertTrue(support["supported"])
+
+    def test_a_task_without_target_identity_falls_back_to_its_own_fields(self):
+        target = canonical_identity_from_task(
+            {"organisation_number": "923609016", "company_name": "Nordic Signal AS", "municipality": "OSLO"}
+        )
+        self.assertEqual(target["organisation_number"], "923609016")
+        self.assertEqual(target["name"], "Nordic Signal AS")
+        self.assertEqual(target["domain"], "")
+        decision = triangulate_identity(target, {"organisation_number": "923609016", "name": "Someone Else AS"})
+        self.assertEqual(decision["status"], EXACT)
+
+    def test_the_planner_carries_the_target_identity_into_every_task(self):
+        tasks = plan_external_tasks(self.profile())
+        self.assertTrue(tasks)
+        for task in tasks:
+            self.assertEqual(task["target_identity"]["organisation_number"], "923609016")
+            self.assertEqual(task["target_identity"]["domain"], "example.no")
+            self.assertEqual(task["target_identity"]["address"]["postcode"], "0159")
+
+
+class _ClaimingConnector(BaseConnector):
+    """A connector that asserts exact identity without proving it."""
+
+    name = "claim_connector"
+    acquisition_mode = "official_api"
+    rights_status = "approved"
+    supported_task_types = {"resolve_places_and_public_rating"}
+    cost_per_request = 0.0
+
+    def __init__(self, observation):
+        self.observation = observation
+
+    def estimate_requests(self, task):
+        return 1
+
+    def execute(self, task, budget, *, now):
+        return ConnectorResult.success(task, [dict(self.observation)], requests_used=1, cost=0.0)
+
+
+class ExternalExecutorIdentityGateTests(unittest.TestCase):
+    """Phase 2: a connector cannot assert its way past the identity gate."""
+
+    now = "2026-01-01T00:00:00Z"
+
+    def observation(self, **overrides):
+        observation = {
+            "id": "claim-0001-0000000",
+            "exact_entity": True,
+            "identity_proof": [{"type": "domain_match", "value": "example.no"}],
+            "platform": "google_places",
+            "signal_type": "place_summary",
+            "source_url": "https://example.no/places/1",
+            "content_sha256": "a" * 64,
+            "acquisition_mode": "official_api",
+            "rights_status": "approved",
+        }
+        observation.update(overrides)
+        return observation
+
+    def run_claim(self, observation):
+        task = mock_task(
+            connector="claim_connector",
+            company_name="Example AS",
+            extra={
+                "target_identity": {
+                    "organisation_number": "923609016",
+                    "name": "Example AS",
+                    "domain": "example.no",
+                    "address": {"street": "Karl Johans gate 1", "postcode": "0159", "city": "Oslo", "municipality": "OSLO"},
+                }
+            },
+        )
+        registry = ConnectorRegistry([_ClaimingConnector(observation)])
+        return run_external_tasks([task], registry=registry, budget=RequestBudget(20), now=self.now)
+
+    def test_a_connector_assertion_without_independent_evidence_is_rejected(self):
+        result = self.run_claim(self.observation())
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(len(result["rejected_observations"]), 1)
+        reasons = result["rejected_observations"][0]["reasons"]
+        self.assertIn("identity triangulation resolved the candidate as ambiguous", reasons)
+
+    def test_name_and_domain_evidence_lets_the_observation_through(self):
+        result = self.run_claim(self.observation(name="Example AS", source_url="https://www.example.no/about"))
+        self.assertEqual(result["rejected_observations"], [])
+        self.assertEqual(len(result["observations"]), 1)
+        self.assertEqual(validate_observation(result["observations"][0]), [])
+
+    def test_a_lookalike_domain_is_rejected_even_with_an_exact_name(self):
+        result = self.run_claim(self.observation(name="Example AS", source_url="https://example-other.no/"))
+        self.assertEqual(result["observations"], [])
+        self.assertIn("identity triangulation resolved the candidate as ambiguous", result["rejected_observations"][0]["reasons"])
+
+    def test_a_foreign_organisation_number_is_rejected_even_with_a_perfect_domain(self):
+        result = self.run_claim(self.observation(organisation_number="111222333", name="Example AS"))
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(result["rejected_observations"][0]["reasons"], ["organisation number does not match the planned task"])
+
+    def test_identity_failure_never_stamps_the_planned_organisation_number_onto_the_candidate(self):
+        result = self.run_claim(self.observation(name="Example AS", source_url="https://example-other.no/"))
+        self.assertNotIn("https://example-other.no", json.dumps(result["rejected_observations"], ensure_ascii=False))
 
 
 if __name__ == "__main__":

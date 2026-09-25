@@ -4,6 +4,8 @@ import hashlib
 import json
 from typing import Any
 
+from .identity_triangulation import canonical_identity_from_profile
+
 
 def _task_id(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -21,6 +23,7 @@ def plan_external_tasks(profile: dict[str, Any]) -> list[dict[str, Any]]:
     website = profile.get("evidence", {}).get("website", {})
     web_value = website.get("value") or {}
     social_links = web_value.get("social_links") or []
+    target_identity = canonical_identity_from_profile(profile)
     tasks: list[dict[str, Any]] = []
 
     def add(connector: str, purpose: str, candidate_url: str | None = None) -> None:
@@ -28,6 +31,7 @@ def plan_external_tasks(profile: dict[str, Any]) -> list[dict[str, Any]]:
             "organisation_number": org,
             "company_name": name,
             "municipality": municipality,
+            "target_identity": target_identity,
             "connector": connector,
             "purpose": purpose,
             "candidate_url": candidate_url,

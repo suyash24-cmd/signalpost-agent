@@ -2,11 +2,18 @@ from __future__ import annotations
 
 """Deterministic executor for the output of ``plan_external_tasks(profile)``.
 
-The executor owns the publishability gate. No observation may be emitted unless
-it independently passes the existing ``validate_observation`` gate, which requires
+The executor owns the publishability gate. No observation may be emitted unless it
+independently passes the existing ``validate_observation`` gate, which requires
 an explicitly verified exact entity, an allowed acquisition mode, and an approved
 rights status. The executor never stamps ``exact_entity`` itself, so external
 observations can never bypass identity verification.
+
+Before that gate runs, every observation is independently triangulated against the
+target company identity carried by the task. A connector cannot assert its way into
+publication: an observation whose identity resolves to anything other than ``exact``
+is rejected with the decision and its reasons, whatever the connector claimed. A
+candidate that declares a foreign organisation number is ``mismatched`` and can never
+be published.
 
 Safety invariant: ABSTAIN > WRONG COMPANY. An unknown connector or unknown
 acquisition mode is an explicit failure (FAILED / NOT_AVAILABLE), never silent
@@ -27,6 +34,10 @@ from typing import Any
 from ..evidence import utc_now
 from ..external_footprint import publishable_observation, validate_observation
 from ..external_tasks import plan_external_tasks
+from ..identity_triangulation import (
+    canonical_identity_from_task,
+    resolve_candidate_identities,
+)
 from .base import (
     ALLOWED_ACQUISITION_MODES,
     ALLOWED_RIGHTS_STATUSES,
@@ -101,6 +112,7 @@ def _gate_observations(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     accepted: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
+    survivors: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for observation in observations:
         declared_org = observation.get("organisation_number")
         if declared_org is not None and str(declared_org) != str(task.get("organisation_number") or ""):
@@ -116,10 +128,22 @@ def _gate_observations(
                 }
             )
             continue
-        item = _observation_item(observation, task, connector, now)
-        if publishable_observation(item):
+        survivors.append((observation, _observation_item(observation, task, connector, now)))
+
+    decisions = resolve_candidate_identities(
+        canonical_identity_from_task(task), [observation for observation, _ in survivors]
+    )
+
+    for (_, item), decision in zip(survivors, decisions):
+        if decision["publishable"] and publishable_observation(item):
             accepted.append(item)
             continue
+        reasons: list[str] = []
+        if not decision["publishable"]:
+            reasons = [
+                f"identity triangulation resolved the candidate as {decision['status']}",
+                *decision["reasons"],
+            ]
         rejected.append(
             {
                 "id": item.get("id"),
@@ -128,7 +152,7 @@ def _gate_observations(
                 "organisation_number": task.get("organisation_number"),
                 "platform": item.get("platform"),
                 "signal_type": item.get("signal_type"),
-                "reasons": validate_observation(item),
+                "reasons": [*reasons, *validate_observation(item)],
             }
         )
     return accepted, rejected
