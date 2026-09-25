@@ -74,7 +74,7 @@ def answer_profile(row: dict[str, Any], question: str) -> dict[str, Any]:
     website = evidence.get("website", {})
     if all_topics or "social" in q:
         value = website.get("value") or {}
-        website_publishable = (value.get("identity_assessment") or {}).get("publishable", True)
+        website_publishable = (value.get("identity_assessment") or {}).get("publishable", False)
         if value.get("description") and website_publishable:
             facts.append(_claim("Website description", value["description"], website, "company_reported_claim"))
         for item in (value.get("social_links") or []) if website_publishable else []:
@@ -199,7 +199,7 @@ def _screen_value(row: dict[str, Any], field: str) -> Any:
         return _latest_financial(row).get(field)
     if field == "website":
         record = row.get("evidence", {}).get("website", {})
-        return record.get("status") == "available" and bool((record.get("value") or {}).get("identity_assessment", {}).get("publishable", True))
+        return record.get("status") == "available" and bool((record.get("value") or {}).get("identity_assessment", {}).get("publishable", False))
     if field == "financials":
         return row.get("evidence", {}).get("financials", {}).get("status") == "available"
     if field == "industry":

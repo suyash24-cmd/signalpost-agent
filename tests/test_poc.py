@@ -4,6 +4,7 @@ import json
 import gzip
 import csv
 import sys
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -29,6 +30,22 @@ from norway_company_agent.external_control import development_score, run_company
 from norway_company_agent.identity import apply_website_identity_gate, assess_social_identity, assess_website_identity  # noqa: E402
 from norway_company_agent.website import _extraction_state, _priority_links, _social_links, assert_public_url, normalize_homepage, normalize_social_url, structured_social_links  # noqa: E402
 from norway_company_agent.batch import evidence_terminal_state, profile_complete_for_modules, read_organisation_inputs, terminal_envelope, validate_envelopes  # noqa: E402
+from norway_company_agent.snapshots import SnapshotFetcher  # noqa: E402
+from norway_company_agent.connectors.base import (  # noqa: E402
+    FAILED,
+    NOT_AVAILABLE,
+    FAILURE_BUDGET_DENIED,
+    FAILURE_CONNECTOR_FAILED,
+    FAILURE_INVALID_TASK,
+    FAILURE_RIGHTS_NOT_APPROVED,
+    FAILURE_UNKNOWN_CONNECTOR,
+    FAILURE_UNSUPPORTED_ACQUISITION_MODE,
+    FAILURE_UNSUPPORTED_TASK_TYPE,
+)
+from norway_company_agent.connectors.budget import RequestBudget  # noqa: E402
+from norway_company_agent.connectors.executor import STAGE_ACQUISITION_GATE, STAGE_ESTIMATE_COERCION, STAGE_EXECUTION, STAGE_REQUEST_ESTIMATION, STAGE_RIGHTS_GATE, STAGE_SUPPORT_CHECK, STAGE_TASK_VALIDATION, run_external_step, run_external_tasks  # noqa: E402
+from norway_company_agent.connectors.registry import ConnectorRegistry, default_registry  # noqa: E402
+from norway_company_agent.connectors.testing import MockConnector, mock_registry, mock_task  # noqa: E402
 from norway_company_agent.snapshots import SnapshotFetcher  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
 from scripts.build_prototype import compact as compact_prototype, qualification_copy  # noqa: E402
@@ -1329,6 +1346,509 @@ class VerifiedSiteSeedTests(unittest.TestCase):
             failed = subprocess.run(command, capture_output=True, text=True)
             self.assertNotEqual(failed.returncode, 0)
             self.assertIn("unknown organisations", failed.stderr)
+
+
+class ResearchWebsiteSafetyTests(unittest.TestCase):
+    def _profile(self, assessment, organisation_number="923609016"):
+        value = {"description": "A family-run workshop in Oslo.", "social_links": [{"platform": "linkedin", "url": "https://www.linkedin.com/company/example-as"}]}
+        if assessment is not None:
+            value["identity_assessment"] = assessment
+        return {
+            "organisation_number": organisation_number,
+            "name": "EXAMPLE AS",
+            "municipality": "OSLO",
+            "evidence": {"website": {"status": "available", "value": value}},
+        }
+
+    def test_missing_identity_assessment_keeps_website_claims_out_of_the_answer(self):
+        result = answer_profile(self._profile(None), "social")
+        self.assertEqual(result["facts"], [])
+        self.assertTrue(any("quarantined" in message for message in result["unsupported_or_uncertain"]))
+
+    def test_explicitly_publishable_identity_allows_website_and_social_claims(self):
+        result = answer_profile(self._profile({"publishable": True}), "social")
+        self.assertEqual(len(result["facts"]), 2)
+        self.assertEqual(result["facts"][0]["claim"], "Website description")
+        self.assertEqual(result["facts"][1]["claim"], "Declared linkedin profile")
+        self.assertEqual(result["unsupported_or_uncertain"], [])
+
+    def test_explicitly_non_publishable_identity_quarantines_website_claims(self):
+        result = answer_profile(self._profile({"publishable": False}), "social")
+        self.assertEqual(result["facts"], [])
+        self.assertTrue(any("quarantined" in message for message in result["unsupported_or_uncertain"]))
+
+    def test_screen_website_filter_requires_a_publishable_identity_assessment(self):
+        rows = [
+            self._profile({"publishable": True}, organisation_number="111111111"),
+            self._profile(None, organisation_number="222222222"),
+            self._profile({"publishable": False}, organisation_number="333333333"),
+        ]
+        result = screen_profiles(rows, "companies in Oslo with a website")
+        self.assertFalse(result["abstained"])
+        self.assertEqual(result["result_count"], 1)
+        self.assertEqual(result["results"][0]["organisation_number"], "111111111")
+
+
+class _SupportsRaisesConnector(MockConnector):
+    def supports(self, task):
+        raise RuntimeError("supports exploded")
+
+
+class _EstimateRaisesConnector(MockConnector):
+    def estimate_requests(self, task):
+        raise ValueError("estimate exploded")
+
+
+class _UncoercibleEstimateConnector(MockConnector):
+    def estimate_requests(self, task):
+        return "not-a-number"
+
+
+class _AcquisitionMetadataRaisesConnector(MockConnector):
+    def __init__(self, **kwargs):
+        self._acquisition_mode = "official_api"
+        super().__init__(**kwargs)
+
+    @property
+    def acquisition_mode(self):
+        raise ZeroDivisionError("acquisition metadata exploded")
+
+    @acquisition_mode.setter
+    def acquisition_mode(self, value):
+        self._acquisition_mode = value
+
+
+class _RightsMetadataRaisesConnector(MockConnector):
+    def __init__(self, **kwargs):
+        self._rights_status = "approved"
+        super().__init__(**kwargs)
+
+    @property
+    def rights_status(self):
+        raise ZeroDivisionError("rights metadata exploded")
+
+    @rights_status.setter
+    def rights_status(self, value):
+        self._rights_status = value
+
+
+class ExternalConnectorExecutorTests(unittest.TestCase):
+    def setUp(self):
+        self.now = "2026-01-15T09:00:00Z"
+        self.previous_guard = os.environ.get("SIGNALPOST_ENABLE_TEST_CONNECTORS")
+        os.environ["SIGNALPOST_ENABLE_TEST_CONNECTORS"] = "1"
+
+    def tearDown(self):
+        if self.previous_guard is None:
+            os.environ.pop("SIGNALPOST_ENABLE_TEST_CONNECTORS", None)
+        else:
+            os.environ["SIGNALPOST_ENABLE_TEST_CONNECTORS"] = self.previous_guard
+
+    def _budget(self, **kwargs):
+        return RequestBudget(kwargs.pop("max_requests", 20), **kwargs)
+
+    def test_unknown_connector_is_an_explicit_failure_not_a_silent_skip(self):
+        result = run_external_tasks(
+            [mock_task(connector="absent_connector")], registry=default_registry(), budget=self._budget(), now=self.now
+        )
+        self.assertEqual(result["planned_tasks"], 1)
+        self.assertEqual(result["completed_tasks"], 0)
+        self.assertEqual(result["observations"], [])
+        self.assertEqual([item["reason"] for item in result["failures"]], [FAILURE_UNKNOWN_CONNECTOR])
+        self.assertEqual(result["failures"][0]["state"], NOT_AVAILABLE)
+        self.assertEqual(result["failures"][0]["connector"], "absent_connector")
+
+    def test_unapproved_acquisition_mode_is_refused_before_any_request(self):
+        registry = mock_registry(MockConnector(acquisition_mode="web_scrape"))
+        budget = self._budget()
+        result = run_external_tasks([mock_task()], registry=registry, budget=budget, now=self.now)
+        self.assertEqual([item["reason"] for item in result["failures"]], [FAILURE_UNSUPPORTED_ACQUISITION_MODE])
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(budget.total_requests, 0)
+
+    def test_unapproved_rights_status_is_refused_before_any_request(self):
+        registry = mock_registry(MockConnector(rights_status="review_required"))
+        budget = self._budget()
+        result = run_external_tasks([mock_task()], registry=registry, budget=budget, now=self.now)
+        self.assertEqual([item["reason"] for item in result["failures"]], [FAILURE_RIGHTS_NOT_APPROVED])
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(budget.total_requests, 0)
+
+    def test_unsupported_task_type_is_refused_before_any_request(self):
+        registry = mock_registry(MockConnector(supported_task_types={"discover_independent_mentions"}))
+        result = run_external_tasks([mock_task()], registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual([item["reason"] for item in result["failures"]], [FAILURE_UNSUPPORTED_TASK_TYPE])
+        self.assertEqual(result["observations"], [])
+
+    def test_unverified_identity_observation_is_rejected_and_never_publishes(self):
+        registry = mock_registry(MockConnector())
+        result = run_external_tasks([mock_task(mode="unverified")], registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(len(result["rejected_observations"]), 1)
+        reasons = result["rejected_observations"][0]["reasons"]
+        self.assertIn("exact legal entity is not verified", reasons)
+        self.assertIn("missing exact-entity proof", reasons)
+
+    def test_ambiguous_identity_observation_is_rejected_and_never_publishes(self):
+        registry = mock_registry(MockConnector())
+        result = run_external_tasks([mock_task(mode="ambiguous")], registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(len(result["rejected_observations"]), 1)
+        self.assertIn("exact legal entity is not verified", result["rejected_observations"][0]["reasons"])
+
+    def test_unapproved_acquisition_mode_in_an_observation_is_rejected(self):
+        registry = mock_registry(MockConnector())
+        result = run_external_tasks([mock_task(mode="unknown_acquisition")], registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["observations"], [])
+        self.assertIn("acquisition mode is not approved for publication", result["rejected_observations"][0]["reasons"])
+
+    def test_unapproved_rights_in_an_observation_is_rejected(self):
+        registry = mock_registry(MockConnector())
+        result = run_external_tasks([mock_task(mode="unapproved_rights")], registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["observations"], [])
+        self.assertIn("source rights are not approved", result["rejected_observations"][0]["reasons"])
+
+    def test_verified_observation_is_published_with_executor_owned_provenance(self):
+        registry = mock_registry(MockConnector())
+        result = run_external_tasks([mock_task()], registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["completed_tasks"], 1)
+        self.assertEqual(result["rejected_observations"], [])
+        observation = result["observations"][0]
+        self.assertEqual(observation["task_id"], mock_task()["task_id"])
+        self.assertEqual(observation["connector"], "mock_places")
+        self.assertEqual(observation["organisation_number"], "923609016")
+        self.assertEqual(observation["retrieved_at"], self.now)
+        self.assertEqual(validate_observation(observation), [])
+
+    def test_observation_for_another_organisation_is_rejected_on_identity(self):
+        registry = mock_registry(MockConnector())
+        result = run_external_tasks([mock_task(mode="cross_organisation")], registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(len(result["rejected_observations"]), 1)
+        self.assertEqual(result["rejected_observations"][0]["reasons"], ["organisation number does not match the planned task"])
+        self.assertNotIn("source_url", result["rejected_observations"][0])
+
+    def test_request_cap_denial_is_recorded_as_budget_failure(self):
+        registry = mock_registry(MockConnector())
+        tasks = [mock_task(extra={"mock_requests": 2}), mock_task(extra={"mock_requests": 2})]
+        result = run_external_tasks(tasks, registry=registry, budget=self._budget(max_requests=3), now=self.now)
+        self.assertEqual(result["failures"][-1]["reason"], FAILURE_BUDGET_DENIED)
+        self.assertEqual(result["failures"][-1]["state"], FAILED)
+        self.assertEqual(result["budget"]["denied_requests"], 2)
+        self.assertEqual(result["budget"]["total_requests"], 2)
+        self.assertEqual(result["budget"]["actual_requests"], 2)
+        self.assertEqual(len(result["observations"]), 1)
+
+    def test_cost_cap_denial_is_recorded_as_budget_failure(self):
+        registry = mock_registry(MockConnector(cost_per_request=1.5))
+        tasks = [mock_task(extra={"mock_requests": 2}), mock_task(extra={"mock_requests": 2})]
+        result = run_external_tasks(tasks, registry=registry, budget=self._budget(max_cost=4.0), now=self.now)
+        self.assertEqual(result["failures"][-1]["reason"], FAILURE_BUDGET_DENIED)
+        self.assertEqual(result["budget"]["denied_cost"], 3.0)
+        self.assertEqual(result["budget"]["actual_cost"], 3.0)
+
+    def test_connector_failure_is_reported_with_reason_and_state(self):
+        registry = mock_registry(MockConnector())
+        result = run_external_tasks([mock_task(mode="fail")], registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["failures"][0]["state"], FAILED)
+        self.assertEqual(result["failures"][0]["reason"], "mock connector failed on record")
+        self.assertEqual(result["failures"][0]["connector"], "mock_places")
+        self.assertEqual(result["observations"], [])
+
+    def test_connector_missing_record_is_not_available_not_failed(self):
+        registry = mock_registry(MockConnector())
+        result = run_external_tasks([mock_task(mode="not_available")], registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["failures"][0]["state"], NOT_AVAILABLE)
+        self.assertEqual(result["failures"][0]["reason"], "mock source reports no record")
+        self.assertEqual(result["observations"], [])
+
+    def test_raising_connector_is_contained_and_never_takes_down_the_batch(self):
+        registry = mock_registry(MockConnector())
+        tasks = [mock_task(mode="raise_error"), mock_task()]
+        result = run_external_tasks(tasks, registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["planned_tasks"], 2)
+        self.assertEqual(result["completed_tasks"], 1)
+        self.assertEqual(result["failures"][0]["reason"], "RuntimeError: mock connector raised")
+        self.assertEqual(result["failures"][0]["state"], FAILED)
+        self.assertEqual(len(result["observations"]), 1)
+
+    def test_support_check_exception_becomes_a_structured_failure(self):
+        task = mock_task(connector="mock_supports_raises")
+        registry = mock_registry(_SupportsRaisesConnector(name="mock_supports_raises"))
+        budget = self._budget()
+        result = run_external_tasks([task], registry=registry, budget=budget, now=self.now)
+        self.assertEqual(result["planned_tasks"], 1)
+        self.assertEqual(result["completed_tasks"], 0)
+        self.assertEqual(result["failed_tasks"], 1)
+        self.assertEqual(result["completed_tasks"] + result["failed_tasks"], result["planned_tasks"])
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(result["rejected_observations"], [])
+        self.assertEqual(len(result["failures"]), 1)
+        failure = result["failures"][0]
+        self.assertEqual(failure["task_id"], task["task_id"])
+        self.assertEqual(failure["connector"], "mock_supports_raises")
+        self.assertEqual(failure["organisation_number"], "923609016")
+        self.assertEqual(failure["state"], FAILED)
+        self.assertEqual(failure["stage"], STAGE_SUPPORT_CHECK)
+        self.assertEqual(failure["reason"], "RuntimeError: supports exploded")
+        self.assertEqual(budget.total_requests, 0)
+
+    def test_estimate_requests_exception_becomes_a_structured_failure(self):
+        task = mock_task(connector="mock_estimate_raises")
+        registry = mock_registry(_EstimateRaisesConnector(name="mock_estimate_raises"))
+        budget = self._budget()
+        result = run_external_tasks([task], registry=registry, budget=budget, now=self.now)
+        self.assertEqual(result["planned_tasks"], 1)
+        self.assertEqual(result["completed_tasks"], 0)
+        self.assertEqual(result["failed_tasks"], 1)
+        self.assertEqual(result["completed_tasks"] + result["failed_tasks"], result["planned_tasks"])
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(len(result["failures"]), 1)
+        failure = result["failures"][0]
+        self.assertEqual(failure["task_id"], task["task_id"])
+        self.assertEqual(failure["connector"], "mock_estimate_raises")
+        self.assertEqual(failure["state"], FAILED)
+        self.assertEqual(failure["stage"], STAGE_REQUEST_ESTIMATION)
+        self.assertEqual(failure["reason"], "ValueError: estimate exploded")
+        self.assertEqual(budget.total_requests, 0)
+
+    def test_estimate_coercion_exception_becomes_a_structured_failure(self):
+        task = mock_task(connector="mock_uncoercible_estimate")
+        registry = mock_registry(_UncoercibleEstimateConnector(name="mock_uncoercible_estimate"))
+        budget = self._budget()
+        result = run_external_tasks([task], registry=registry, budget=budget, now=self.now)
+        self.assertEqual(result["planned_tasks"], 1)
+        self.assertEqual(result["completed_tasks"], 0)
+        self.assertEqual(result["failed_tasks"], 1)
+        self.assertEqual(result["completed_tasks"] + result["failed_tasks"], result["planned_tasks"])
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(len(result["failures"]), 1)
+        failure = result["failures"][0]
+        self.assertEqual(failure["task_id"], task["task_id"])
+        self.assertEqual(failure["connector"], "mock_uncoercible_estimate")
+        self.assertEqual(failure["state"], FAILED)
+        self.assertEqual(failure["stage"], STAGE_ESTIMATE_COERCION)
+        self.assertIn("invalid literal for int()", failure["reason"])
+        self.assertEqual(budget.total_requests, 0)
+
+    def test_execute_exception_records_the_execution_stage(self):
+        task = mock_task(mode="raise_error")
+        registry = mock_registry(MockConnector())
+        result = run_external_tasks([task], registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["completed_tasks"], 0)
+        self.assertEqual(result["failed_tasks"], 1)
+        self.assertEqual(result["observations"], [])
+        failure = result["failures"][0]
+        self.assertEqual(failure["task_id"], task["task_id"])
+        self.assertEqual(failure["connector"], "mock_places")
+        self.assertEqual(failure["state"], FAILED)
+        self.assertEqual(failure["stage"], STAGE_EXECUTION)
+        self.assertEqual(failure["reason"], "RuntimeError: mock connector raised")
+
+    def test_one_raising_connector_task_does_not_stop_the_remaining_tasks(self):
+        registry = mock_registry(_EstimateRaisesConnector(name="mock_estimate_raises"), MockConnector())
+        tasks = [
+            mock_task(connector="mock_places"),
+            mock_task(connector="mock_estimate_raises"),
+            mock_task(connector="mock_places", mode="unverified"),
+            mock_task(connector="mock_places", purpose="discover_active_jobs"),
+        ]
+        result = run_external_tasks(tasks, registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["planned_tasks"], 4)
+        self.assertEqual(result["completed_tasks"], 3)
+        self.assertEqual(result["failed_tasks"], 1)
+        self.assertEqual(result["completed_tasks"] + result["failed_tasks"], result["planned_tasks"])
+        self.assertEqual(len(result["observations"]), 2)
+        self.assertEqual(len(result["rejected_observations"]), 1)
+        self.assertEqual(len(result["failures"]), 1)
+        self.assertEqual(result["failures"][0]["connector"], "mock_estimate_raises")
+        self.assertEqual(result["failures"][0]["stage"], STAGE_REQUEST_ESTIMATION)
+        self.assertEqual({item["organisation_number"] for item in result["observations"]}, {"923609016"})
+
+    def test_acquisition_metadata_property_exception_becomes_a_structured_failure(self):
+        task = mock_task(connector="mock_acquisition_raises")
+        registry = mock_registry(_AcquisitionMetadataRaisesConnector(name="mock_acquisition_raises"))
+        budget = self._budget()
+        result = run_external_tasks([task], registry=registry, budget=budget, now=self.now)
+        self.assertEqual(result["planned_tasks"], 1)
+        self.assertEqual(result["completed_tasks"], 0)
+        self.assertEqual(result["failed_tasks"], 1)
+        self.assertEqual(result["completed_tasks"] + result["failed_tasks"], result["planned_tasks"])
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(len(result["failures"]), 1)
+        failure = result["failures"][0]
+        self.assertEqual(failure["task_id"], task["task_id"])
+        self.assertEqual(failure["connector"], "mock_acquisition_raises")
+        self.assertEqual(failure["organisation_number"], "923609016")
+        self.assertEqual(failure["state"], FAILED)
+        self.assertEqual(failure["stage"], STAGE_ACQUISITION_GATE)
+        self.assertEqual(failure["reason"], "ZeroDivisionError: acquisition metadata exploded")
+        self.assertEqual(budget.total_requests, 0)
+
+    def test_rights_metadata_property_exception_becomes_a_structured_failure(self):
+        task = mock_task(connector="mock_rights_raises")
+        registry = mock_registry(_RightsMetadataRaisesConnector(name="mock_rights_raises"))
+        budget = self._budget()
+        result = run_external_tasks([task], registry=registry, budget=budget, now=self.now)
+        self.assertEqual(result["planned_tasks"], 1)
+        self.assertEqual(result["completed_tasks"], 0)
+        self.assertEqual(result["failed_tasks"], 1)
+        self.assertEqual(result["completed_tasks"] + result["failed_tasks"], result["planned_tasks"])
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(len(result["failures"]), 1)
+        failure = result["failures"][0]
+        self.assertEqual(failure["task_id"], task["task_id"])
+        self.assertEqual(failure["connector"], "mock_rights_raises")
+        self.assertEqual(failure["state"], FAILED)
+        self.assertEqual(failure["stage"], STAGE_RIGHTS_GATE)
+        self.assertEqual(failure["reason"], "ZeroDivisionError: rights metadata exploded")
+        self.assertEqual(budget.total_requests, 0)
+
+    def test_malformed_non_dict_task_becomes_a_structured_failure(self):
+        result = run_external_tasks(["not-a-dict"], registry=mock_registry(), budget=self._budget(), now=self.now)
+        self.assertEqual(result["planned_tasks"], 1)
+        self.assertEqual(result["completed_tasks"], 0)
+        self.assertEqual(result["failed_tasks"], 1)
+        self.assertEqual(result["completed_tasks"] + result["failed_tasks"], result["planned_tasks"])
+        self.assertEqual(result["observations"], [])
+        self.assertEqual(len(result["failures"]), 1)
+        failure = result["failures"][0]
+        self.assertEqual(failure["task_id"], json.dumps("not-a-dict", ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        self.assertIsNone(failure["connector"])
+        self.assertIsNone(failure["organisation_number"])
+        self.assertEqual(failure["state"], FAILED)
+        self.assertEqual(failure["stage"], STAGE_TASK_VALIDATION)
+        self.assertEqual(failure["reason"], FAILURE_INVALID_TASK)
+
+    def test_mixed_malformed_and_raising_tasks_leave_every_planned_task_with_an_outcome(self):
+        registry = mock_registry(_AcquisitionMetadataRaisesConnector(name="mock_acquisition_raises"), MockConnector())
+        tasks = [
+            "not-a-dict",
+            mock_task(connector="mock_acquisition_raises"),
+            mock_task(connector="mock_places"),
+            mock_task(connector="mock_places", purpose="discover_active_jobs"),
+        ]
+        result = run_external_tasks(tasks, registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["planned_tasks"], 4)
+        self.assertEqual(result["completed_tasks"], 2)
+        self.assertEqual(result["failed_tasks"], 2)
+        self.assertEqual(result["completed_tasks"] + result["failed_tasks"], result["planned_tasks"])
+        self.assertEqual(len(result["observations"]), 2)
+        self.assertEqual(len(result["failures"]), 2)
+        self.assertEqual({item["stage"] for item in result["failures"]}, {STAGE_TASK_VALIDATION, STAGE_ACQUISITION_GATE})
+        self.assertEqual({item["organisation_number"] for item in result["observations"]}, {"923609016"})
+
+    def test_no_planned_task_is_silently_dropped(self):
+        registry = mock_registry(MockConnector())
+        tasks = [mock_task(mode="fail"), mock_task(mode="unverified"), mock_task()]
+        result = run_external_tasks(tasks, registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(result["planned_tasks"], 3)
+        self.assertEqual(result["completed_tasks"] + result["failed_tasks"], 3)
+        self.assertEqual(result["failed_tasks"], 1)
+        self.assertEqual(len(result["rejected_observations"]), 1)
+        self.assertEqual(len(result["observations"]), 1)
+        self.assertTrue(result["rejected_observations"][0]["reasons"])
+
+    def test_execution_is_deterministic_for_a_fixed_timestamp(self):
+        registry = mock_registry(MockConnector())
+        tasks = [mock_task(mode="unverified"), mock_task(), mock_task(mode="fail")]
+        first = run_external_tasks(tasks, registry=registry, budget=self._budget(), now=self.now)
+        second = run_external_tasks(tasks, registry=registry, budget=self._budget(), now=self.now)
+        self.assertEqual(first["observations"], second["observations"])
+        self.assertEqual(first["failures"], second["failures"])
+        self.assertEqual(first["rejected_observations"], second["rejected_observations"])
+
+    def test_default_registry_never_contains_test_connectors(self):
+        self.assertEqual(len(default_registry()), 0)
+        self.assertNotIn("mock_places", default_registry())
+
+    def test_mock_registry_refuses_to_load_without_the_explicit_test_guard(self):
+        os.environ.pop("SIGNALPOST_ENABLE_TEST_CONNECTORS", None)
+        with self.assertRaises(RuntimeError):
+            mock_registry()
+        os.environ["SIGNALPOST_ENABLE_TEST_CONNECTORS"] = "1"
+        self.assertIn("mock_places", mock_registry())
+
+
+class ExternalStepTerminalGateTests(unittest.TestCase):
+    def setUp(self):
+        self.now = "2026-01-15T09:00:00Z"
+        self.previous_guard = os.environ.get("SIGNALPOST_ENABLE_TEST_CONNECTORS")
+        os.environ["SIGNALPOST_ENABLE_TEST_CONNECTORS"] = "1"
+
+    def tearDown(self):
+        if self.previous_guard is None:
+            os.environ.pop("SIGNALPOST_ENABLE_TEST_CONNECTORS", None)
+        else:
+            os.environ["SIGNALPOST_ENABLE_TEST_CONNECTORS"] = self.previous_guard
+
+    def _planned_registry(self, mode):
+        purposes = {
+            "resolve_places_and_public_rating",
+            "discover_independent_mentions",
+            "discover_active_jobs",
+            "discover_social_handles",
+        }
+        return mock_registry(*[
+            MockConnector(name=name, supported_task_types=purposes, default_mode=mode)
+            for name in ("google_places_api", "licensed_news_search", "jobs_provider", "permitted_search_api")
+        ])
+
+    def _step(self, mode):
+        profile = {"organisation_number": "923609016", "name": "EXAMPLE AS"}
+        step = run_external_step(profile, registry=self._planned_registry(mode), budget=RequestBudget(20), now=self.now)
+        profile["external_observations"] = step["observations"]
+        profile["external_step"] = {key: value for key, value in step.items() if key != "observations"}
+        return profile, step
+
+    def test_unverified_observations_never_reach_terminal_output(self):
+        profile, step = self._step("unverified")
+        self.assertEqual(profile["external_observations"], [])
+        self.assertEqual(step["rejected_count"], 4)
+        envelope = terminal_envelope(profile, run_id="test-run", modules=sorted(profile.get("evidence", {})), started_at=self.now, completed_at=self.now)
+        self.assertEqual(envelope["profile"]["external_observations"], [])
+        serialized = json.dumps(envelope, ensure_ascii=False)
+        self.assertNotIn("https://example.test/places/123456789", serialized)
+        self.assertNotIn("4.5", serialized)
+        for rejection in step["rejections"]:
+            self.assertIn("exact legal entity is not verified", rejection["reasons"])
+            self.assertNotIn("source_url", rejection)
+            self.assertNotIn("content_sha256", rejection)
+            self.assertNotIn("identity_proof", rejection)
+            self.assertIn(rejection["id"], serialized)
+
+    def test_ambiguous_observations_never_reach_terminal_output(self):
+        profile, step = self._step("ambiguous")
+        self.assertEqual(profile["external_observations"], [])
+        self.assertEqual(step["rejected_count"], 4)
+        self.assertTrue(all("exact legal entity is not verified" in item["reasons"] for item in step["rejections"]))
+
+    def test_only_publishable_observations_are_serialized_into_the_terminal_envelope(self):
+        profile, step = self._step("success")
+        self.assertEqual(step["rejected_count"], 0)
+        self.assertEqual(step["failures"], [])
+        self.assertEqual(len(profile["external_observations"]), 4)
+        for observation in profile["external_observations"]:
+            self.assertEqual(validate_observation(observation), [])
+            self.assertTrue(publishable_observation(observation))
+        envelope = terminal_envelope(
+            profile,
+            run_id="test-run",
+            modules=sorted(profile.get("evidence", {})),
+            started_at=self.now,
+            completed_at=self.now,
+        )
+        self.assertEqual(envelope["state"], "complete")
+        self.assertEqual(len(envelope["profile"]["external_observations"]), 4)
+        for observation in profile["external_observations"]:
+            self.assertIn(observation["id"], json.dumps(envelope, ensure_ascii=False))
+
+    def test_unverified_step_never_serializes_its_evidence_payload(self):
+        profile, step = self._step("unverified")
+        self.assertEqual(step["observations"], [])
+        self.assertEqual({item["connector"] for item in step["rejections"]}, {"google_places_api", "licensed_news_search", "jobs_provider", "permitted_search_api"})
+        envelope = terminal_envelope(profile, run_id="test-run", modules=sorted(profile.get("evidence", {})), started_at=self.now, completed_at=self.now)
+        self.assertNotIn("https://example.test/places/123456789", json.dumps(envelope, ensure_ascii=False))
 
 
 if __name__ == "__main__":

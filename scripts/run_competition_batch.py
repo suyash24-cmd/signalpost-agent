@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from norway_company_agent.batch import profile_complete_for_modules, profiles_from_bulk, read_organisation_inputs, terminal_envelope, validate_envelopes  # noqa: E402
+from norway_company_agent.connectors import default_registry, run_external_step  # noqa: E402
+from norway_company_agent.connectors.budget import RequestBudget  # noqa: E402
 from norway_company_agent.evidence import utc_now  # noqa: E402
 from norway_company_agent.identity import apply_website_identity_gate  # noqa: E402
 from norway_company_agent.official import fetch_official_modules  # noqa: E402
@@ -39,6 +41,9 @@ def main() -> None:
     parser.add_argument("--checkpoint-every", type=int, default=25)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--modules", default="registry,accounting_obligation,registry_live,financials,roles,group,locations,website")
+    parser.add_argument("--external-executor", action="store_true", help="Run planned external tasks through the connector registry after the website identity gate (default: off, no behaviour change)")
+    parser.add_argument("--external-max-requests", type=int, default=20, help="Per-company external outbound request ceiling")
+    parser.add_argument("--external-max-cost", type=float, default=0.0, help="Per-company external outbound cost ceiling in USD; 0 means free-only")
     args = parser.parse_args()
 
     started_at = utc_now()
@@ -68,6 +73,12 @@ def main() -> None:
             "bytes": sum(item.bytes_received for item in metrics) + website_metrics["bytes"],
             "latencies_ms": [item.elapsed_ms for item in metrics] + website_metrics["latencies_ms"],
         }
+        if args.external_executor:
+            budget = RequestBudget(max_requests=args.external_max_requests, max_cost=args.external_max_cost)
+            step = run_external_step(profile, registry=default_registry(), budget=budget, now=utc_now())
+            profile["external_observations"] = step["observations"]
+            profile["external_step"] = {key: value for key, value in step.items() if key != "observations"}
+            metric["requests"] += step["budget"]["total_requests"]
         profile["run_metrics"] = metric
         return profile, metric
 
@@ -120,6 +131,18 @@ def main() -> None:
         "modules": requested_modules,
         "registry": registry_metadata,
         "operations": operations,
+        "external": {
+            "enabled": args.external_executor,
+            "max_requests_per_company": args.external_max_requests,
+            "max_cost_per_company": args.external_max_cost,
+            "planned_tasks": sum((profile.get("external_step") or {}).get("planned_tasks", 0) for profile in ordered_profiles) if args.external_executor else 0,
+            "completed_tasks": sum((profile.get("external_step") or {}).get("completed_tasks", 0) for profile in ordered_profiles) if args.external_executor else 0,
+            "failed_tasks": sum((profile.get("external_step") or {}).get("failed_tasks", 0) for profile in ordered_profiles) if args.external_executor else 0,
+            "observations": sum(len(profile.get("external_observations") or []) for profile in ordered_profiles) if args.external_executor else 0,
+            "rejected_observations": sum((profile.get("external_step") or {}).get("rejected_count", 0) for profile in ordered_profiles) if args.external_executor else 0,
+            "requests": sum((profile.get("external_step") or {}).get("budget", {}).get("total_requests", 0) for profile in ordered_profiles) if args.external_executor else 0,
+            "cost": round(sum((profile.get("external_step") or {}).get("budget", {}).get("actual_cost", 0.0) for profile in ordered_profiles), 6) if args.external_executor else 0.0,
+        },
         "validation": validation,
     }
     Path(args.report).parent.mkdir(parents=True, exist_ok=True)
