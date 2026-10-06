@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from norway_company_agent.batch import profile_complete_for_modules, profiles_from_bulk, read_organisation_inputs, terminal_envelope, validate_envelopes  # noqa: E402
+from norway_company_agent.claims import build_evidence_and_claims  # noqa: E402
 from norway_company_agent.connectors import default_registry, run_external_step  # noqa: E402
 from norway_company_agent.connectors.budget import RequestBudget  # noqa: E402
 from norway_company_agent.evidence import utc_now  # noqa: E402
@@ -78,6 +79,15 @@ def main() -> None:
             step = run_external_step(profile, registry=default_registry(), budget=budget, now=utc_now())
             profile["external_observations"] = step["observations"]
             profile["external_step"] = {key: value for key, value in step.items() if key != "observations"}
+            built = build_evidence_and_claims(profile, step["observations"])
+            profile["external_evidence"] = built["evidence"]
+            profile["external_claims"] = built["claims"]
+            if built["rejections"]:
+                profile["external_step"]["rejections"] = [
+                    *(profile["external_step"].get("rejections") or []),
+                    *built["rejections"],
+                ]
+                profile["external_step"]["rejected_count"] = len(profile["external_step"]["rejections"])
             metric["requests"] += step["budget"]["total_requests"]
         profile["run_metrics"] = metric
         return profile, metric

@@ -137,6 +137,7 @@ def terminal_envelope(
         "started_at": started_at,
         "completed_at": completed_at,
         "modules": module_states,
+        "claims": list(profile.get("external_claims") or []),
         "profile": profile,
     }
 

@@ -15,6 +15,19 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from norway_company_agent.evidence import evidence  # noqa: E402
+from norway_company_agent.claims import (  # noqa: E402
+    CLAIM_CLASSIFICATION,
+    CLAIM_CONFLICT,
+    CLAIM_PUBLISHED,
+    METHOD,
+    assemble_claims,
+    build_evidence_and_claims,
+    claim_id,
+    diff_claims,
+    evidence_id,
+    normalize_claim_value,
+    structured_facts,
+)
 from norway_company_agent.crawl_events import extract_page_event, merge_profile_events, missing_seed_error_events  # noqa: E402
 from norway_company_agent.discovery import build_company_search_query, choose_search_candidate, parse_brave_web_results, score_search_candidate  # noqa: E402
 from norway_company_agent.official import _reserve_history_slot, accounting_obligation_assessment, normalize_entity, normalize_financial_history, normalize_financials, normalize_roles  # noqa: E402
@@ -2261,6 +2274,376 @@ class ExternalExecutorIdentityGateTests(unittest.TestCase):
     def test_identity_failure_never_stamps_the_planned_organisation_number_onto_the_candidate(self):
         result = self.run_claim(self.observation(name="Example AS", source_url="https://example-other.no/"))
         self.assertNotIn("https://example-other.no", json.dumps(result["rejected_observations"], ensure_ascii=False))
+
+
+class ObservationEvidenceClaimTests(unittest.TestCase):
+    """Phase 3: the single deterministic observation -> evidence -> claim path."""
+
+    now = "2026-01-01T00:00:00Z"
+
+    def profile(self, **overrides):
+        profile = {"organisation_number": "923609016", "name": "Example AS", "evidence": {}}
+        profile.update(overrides)
+        return profile
+
+    def observation(self, **overrides):
+        observation = {
+            "id": "obs-0001-0000000",
+            "task_id": "task-0001-0000000",
+            "connector": "google_places_api",
+            "organisation_number": "923609016",
+            "platform": "google_places",
+            "signal_type": "place_summary",
+            "source_url": "https://example.no/places/1",
+            "retrieved_at": "2026-01-01T00:00:00Z",
+            "content_sha256": "a" * 64,
+            "exact_entity": True,
+            "identity_proof": [{"type": "domain_match", "value": "example.no"}],
+            "acquisition_mode": "official_api",
+            "rights_status": "approved",
+            "metrics": {"rating": 4.5, "review_count": 87},
+        }
+        observation.update(overrides)
+        return observation
+
+    def test_a_valid_observation_becomes_evidence_and_published_claims(self):
+        built = build_evidence_and_claims(self.profile(), [self.observation()])
+        self.assertEqual(built["rejections"], [])
+        self.assertEqual(len(built["evidence"]), 1)
+        record = built["evidence"][0]
+        self.assertEqual(record["status"], "available")
+        self.assertEqual(record["organisation_number"], "923609016")
+        self.assertEqual(record["identity"]["status"], "exact")
+        self.assertEqual(record["identity"]["organisation_number"], "923609016")
+        self.assertEqual(record["source_url"], "https://example.no/places/1")
+        self.assertEqual(record["content_sha256"], "a" * 64)
+        self.assertEqual(record["retrieved_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(record["acquisition_mode"], "official_api")
+        self.assertEqual(record["rights_status"], "approved")
+        self.assertEqual(record["evidence_id"], evidence_id("923609016", "https://example.no/places/1", "a" * 64, record["value"]))
+        self.assertEqual(record["unsupported_fact_fields"], [])
+        self.assertEqual({item["field"] for item in record["value"]}, {"rating", "review_count"})
+
+        claims = built["claims"]
+        self.assertEqual({item["field"] for item in claims}, {"rating", "review_count"})
+        for claim in claims:
+            self.assertEqual(claim["state"], CLAIM_PUBLISHED)
+            self.assertEqual(claim["classification"], CLAIM_CLASSIFICATION)
+            self.assertEqual(claim["organisation_number"], "923609016")
+            self.assertEqual(claim["evidence_ids"], [record["evidence_id"]])
+            self.assertEqual(claim["source_urls"], ["https://example.no/places/1"])
+            self.assertEqual(claim["method"], METHOD)
+            self.assertEqual(claim["identity"]["status"], "exact")
+            self.assertEqual(
+                claim["claim_id"],
+                claim_id("923609016", claim["field"], claim["normalized_value"], claim["state"]),
+            )
+            self.assertNotIn("confidence", claim)
+            self.assertNotIn("score", claim)
+            self.assertNotIn("probability", claim)
+        by_field = {item["field"]: item for item in claims}
+        self.assertEqual(by_field["rating"]["value"], 4.5)
+        self.assertEqual(by_field["review_count"]["value"], 87)
+
+    def test_published_claims_are_carried_by_the_terminal_envelope(self):
+        built = build_evidence_and_claims(self.profile(), [self.observation()])
+        profile = self.profile(external_claims=built["claims"])
+        envelope = terminal_envelope(profile, run_id="run-1", modules=[], started_at=self.now, completed_at=self.now)
+        required = {
+            "run_id",
+            "organisation_number",
+            "state",
+            "started_at",
+            "completed_at",
+            "modules",
+            "profile",
+            "claims",
+        }
+        self.assertTrue(required.issubset(set(envelope)))
+        self.assertEqual(envelope["claims"], built["claims"])
+        self.assertEqual(envelope["state"], "complete")
+        plain = terminal_envelope(self.profile(), run_id="run-1", modules=[], started_at=self.now, completed_at=self.now)
+        self.assertEqual(plain["claims"], [])
+
+    def test_a_wrong_company_observation_never_produces_evidence_or_a_claim(self):
+        built = build_evidence_and_claims(self.profile(), [self.observation(organisation_number="111222333")])
+        self.assertEqual(built["evidence"], [])
+        self.assertEqual(built["claims"], [])
+        self.assertEqual(len(built["rejections"]), 1)
+        rejection = built["rejections"][0]
+        self.assertEqual(rejection["state"], "mismatched")
+        self.assertEqual(rejection["organisation_number"], "923609016")
+        for leaked in ("value", "source_url", "content_sha256", "identity_proof", "evidence_id", "metrics"):
+            self.assertNotIn(leaked, rejection)
+        self.assertNotIn("4.5", json.dumps(built, ensure_ascii=False))
+
+    def test_an_ambiguous_identity_never_produces_a_claim(self):
+        observation = self.observation(name="Example AS")
+        observation.pop("organisation_number")
+        built = build_evidence_and_claims(self.profile(), [observation])
+        self.assertEqual(built["evidence"], [])
+        self.assertEqual(built["claims"], [])
+        self.assertEqual(built["rejections"][0]["state"], "ambiguous")
+
+    def test_an_unverified_identity_never_produces_a_claim(self):
+        observation = self.observation()
+        observation.pop("organisation_number")
+        built = build_evidence_and_claims(self.profile(), [observation])
+        self.assertEqual(built["evidence"], [])
+        self.assertEqual(built["claims"], [])
+        self.assertEqual(built["rejections"][0]["state"], "unverified")
+
+    def test_unapproved_acquisition_mode_blocks_any_claim(self):
+        built = build_evidence_and_claims(self.profile(), [self.observation(acquisition_mode="jobspy_experiment")])
+        self.assertEqual(built["evidence"], [])
+        self.assertEqual(built["claims"], [])
+        rejection = built["rejections"][0]
+        self.assertEqual(rejection["state"], "blocked")
+        self.assertIn("acquisition mode is not approved for publication", rejection["reasons"])
+
+    def test_unapproved_rights_block_any_claim(self):
+        built = build_evidence_and_claims(self.profile(), [self.observation(rights_status="review_required")])
+        self.assertEqual(built["evidence"], [])
+        self.assertEqual(built["claims"], [])
+        rejection = built["rejections"][0]
+        self.assertEqual(rejection["state"], "blocked")
+        self.assertIn("source rights are not approved", rejection["reasons"])
+
+    def test_identity_failures_outrank_rights_blocks(self):
+        wrong_company = self.observation(organisation_number="111222333", acquisition_mode="jobspy_experiment")
+        self.assertEqual(build_evidence_and_claims(self.profile(), [wrong_company])["rejections"][0]["state"], "mismatched")
+        observation = self.observation(name="Example AS", rights_status="review_required")
+        observation.pop("organisation_number")
+        self.assertEqual(build_evidence_and_claims(self.profile(), [observation])["rejections"][0]["state"], "ambiguous")
+
+    def test_a_profile_without_an_organisation_number_never_receives_a_claim(self):
+        profile = self.profile(
+            organisation_number="",
+            evidence={"registry_live": {"value": {"website": "https://example.no"}}},
+        )
+        built = build_evidence_and_claims(profile, [self.observation(name="Example AS")])
+        self.assertEqual(built["evidence"], [])
+        self.assertEqual(built["claims"], [])
+        self.assertEqual(built["rejections"][0]["state"], "unverified")
+
+    def test_the_same_observation_twice_never_duplicates_a_claim(self):
+        observation = self.observation()
+        built = build_evidence_and_claims(self.profile(), [observation, observation])
+        self.assertEqual(len(built["evidence"]), 1)
+        self.assertEqual(len(built["claims"]), 2)
+        for claim in built["claims"]:
+            self.assertEqual(len(claim["evidence_ids"]), 1)
+        self.assertEqual(built["rejections"], [])
+
+    def test_two_sources_corroborate_one_claim(self):
+        second = self.observation(
+            id="obs-0002-0000000",
+            source_url="https://example.no/places/2",
+            content_sha256="b" * 64,
+        )
+        built = build_evidence_and_claims(self.profile(), [self.observation(), second])
+        self.assertEqual(len(built["evidence"]), 2)
+        self.assertEqual(len(built["claims"]), 2)
+        for claim in built["claims"]:
+            self.assertEqual(len(claim["evidence_ids"]), 2)
+            self.assertEqual(claim["source_urls"], ["https://example.no/places/1", "https://example.no/places/2"])
+            self.assertEqual(claim["state"], CLAIM_PUBLISHED)
+
+    def test_every_observation_ends_as_evidence_or_as_an_explicit_rejection(self):
+        observations = [
+            self.observation(),
+            self.observation(id="obs-0002-0000000", organisation_number="111222333"),
+            self.observation(id="obs-0003-0000000", rights_status="review_required"),
+            self.observation(id="obs-0004-0000000", name="Example AS", organisation_number=None),
+        ]
+        built = build_evidence_and_claims(self.profile(), observations)
+        self.assertEqual(len(built["evidence"]) + len(built["rejections"]), len(observations))
+        self.assertEqual({item["state"] for item in built["rejections"]}, {"mismatched", "blocked", "ambiguous"})
+
+    def test_identical_input_produces_identical_output_and_no_reported_change(self):
+        first = build_evidence_and_claims(self.profile(), [self.observation()])
+        second = build_evidence_and_claims(self.profile(), [self.observation()])
+        self.assertEqual(json.dumps(first, ensure_ascii=False, sort_keys=True), json.dumps(second, ensure_ascii=False, sort_keys=True))
+        self.assertEqual(diff_claims(first["claims"], second["claims"]), [])
+
+    def test_a_retrieval_timestamp_change_alone_is_not_a_claim_change(self):
+        first = build_evidence_and_claims(self.profile(), [self.observation()])
+        refetched = build_evidence_and_claims(
+            self.profile(), [self.observation(retrieved_at="2026-02-01T00:00:00Z")]
+        )
+        self.assertEqual(first["evidence"][0]["evidence_id"], refetched["evidence"][0]["evidence_id"])
+        self.assertEqual(diff_claims(first["claims"], refetched["claims"]), [])
+
+    def test_changed_source_content_is_a_real_claim_change(self):
+        first = build_evidence_and_claims(self.profile(), [self.observation()])
+        changed = build_evidence_and_claims(self.profile(), [self.observation(content_sha256="b" * 64)])
+        changes = diff_claims(first["claims"], changed["claims"])
+        self.assertEqual(len(changes), 2)
+        self.assertEqual({item["change"] for item in changes}, {"changed"})
+        for item in changes:
+            self.assertNotEqual(item["evidence_ids"], [])
+            self.assertNotEqual(item["old_value"], None)
+
+    def test_claims_that_disappear_are_reported_as_removed_and_new_ones_as_added(self):
+        built = build_evidence_and_claims(self.profile(), [self.observation()])
+        changes = diff_claims([], built["claims"])
+        self.assertEqual({item["change"] for item in changes}, {"added"})
+        self.assertEqual({item["change"] for item in diff_claims(built["claims"], [])}, {"removed"})
+
+    def test_conflicting_values_produce_one_explicit_conflict_claim(self):
+        first = self.observation(metrics={"rating": 4.5})
+        second = self.observation(
+            id="obs-0002-0000000",
+            source_url="https://example.no/places/2",
+            content_sha256="b" * 64,
+            metrics={"rating": 3.0},
+        )
+        built = build_evidence_and_claims(self.profile(), [first, second])
+        self.assertEqual(len(built["claims"]), 1)
+        claim = built["claims"][0]
+        self.assertEqual(claim["state"], CLAIM_CONFLICT)
+        self.assertEqual(claim["normalized_value"], [3.0, 4.5])
+        self.assertIn(claim["value"], (3.0, 4.5))
+        self.assertEqual(len(claim["evidence_ids"]), 2)
+        self.assertEqual(len(claim["source_urls"]), 2)
+
+    def test_conflict_handling_never_depends_on_input_order(self):
+        first = self.observation(metrics={"rating": 4.5})
+        second = self.observation(
+            id="obs-0002-0000000",
+            source_url="https://example.no/places/2",
+            content_sha256="b" * 64,
+            metrics={"rating": 3.0, "review_count": 12},
+        )
+        forward = build_evidence_and_claims(self.profile(), [first, second])
+        reverse = build_evidence_and_claims(self.profile(), [second, first])
+        self.assertEqual(
+            json.dumps(forward["claims"], ensure_ascii=False, sort_keys=True),
+            json.dumps(reverse["claims"], ensure_ascii=False, sort_keys=True),
+        )
+        self.assertEqual(
+            json.dumps(forward["evidence"], ensure_ascii=False, sort_keys=True),
+            json.dumps(reverse["evidence"], ensure_ascii=False, sort_keys=True),
+        )
+
+    def test_profiles_never_receive_each_others_claims(self):
+        other = self.profile(organisation_number="111222333", name="Other AS")
+        leaked = build_evidence_and_claims(other, [self.observation()])
+        self.assertEqual(leaked["claims"], [])
+        self.assertEqual(leaked["rejections"][0]["state"], "mismatched")
+        own = build_evidence_and_claims(other, [self.observation(organisation_number="111222333")])
+        self.assertEqual(len(own["claims"]), 2)
+        self.assertEqual({item["organisation_number"] for item in own["claims"]}, {"111222333"})
+        mine = build_evidence_and_claims(self.profile(), [self.observation()])
+        self.assertFalse({item["claim_id"] for item in own["claims"]} & {item["claim_id"] for item in mine["claims"]})
+
+    def test_two_distinct_exact_candidates_in_one_batch_are_all_downgraded(self):
+        profile = self.profile(evidence={"registry_live": {"value": {"website": "https://example.no"}}})
+        first = self.observation()
+        second = self.observation(
+            id="obs-0002-0000000",
+            organisation_number=None,
+            name="Example AS",
+            source_url="https://example.no/about",
+        )
+        built = build_evidence_and_claims(profile, [first, second])
+        self.assertEqual(built["evidence"], [])
+        self.assertEqual(built["claims"], [])
+        self.assertEqual(len(built["rejections"]), 2)
+        self.assertEqual({item["state"] for item in built["rejections"]}, {"ambiguous"})
+
+    def test_unserializable_fact_values_are_reported_and_never_silently_dropped(self):
+        observation = self.observation(metrics={"rating": 4.5, "headcount": b"bytes"})
+        facts, unsupported = structured_facts(observation)
+        self.assertEqual(unsupported, ["headcount"])
+        self.assertEqual([item[0] for item in facts], ["rating"])
+        built = build_evidence_and_claims(self.profile(), [observation])
+        self.assertEqual(built["evidence"][0]["unsupported_fact_fields"], ["headcount"])
+        self.assertEqual({item["field"] for item in built["claims"]}, {"rating"})
+
+    def test_facts_use_the_canonical_connector_contract(self):
+        observation = self.observation(facts=[{"field": "employee_count", "value": 12}])
+        built = build_evidence_and_claims(self.profile(), [observation])
+        self.assertEqual(len(built["claims"]), 1)
+        self.assertEqual(built["claims"][0]["value"], 12)
+        self.assertEqual(built["claims"][0]["normalized_value"], 12.0)
+
+    def test_claim_value_normalization_collapses_equivalent_representations(self):
+        self.assertEqual(normalize_claim_value("  Big   Corp "), "big corp")
+        self.assertEqual(normalize_claim_value(87), 87.0)
+        self.assertEqual(normalize_claim_value(87.0), 87.0)
+        self.assertEqual(normalize_claim_value(True), True)
+        self.assertEqual(normalize_claim_value({"b": 1, "a": 2}), '{"a":2,"b":1}')
+        self.assertEqual(normalize_claim_value("BIG CORP"), normalize_claim_value("big corp"))
+
+    def test_equivalent_values_from_two_sources_never_become_a_conflict(self):
+        first = self.observation(metrics={"review_count": 87})
+        second = self.observation(
+            id="obs-0002-0000000",
+            source_url="https://example.no/places/2",
+            content_sha256="b" * 64,
+            metrics={"review_count": 87.0},
+        )
+        built = build_evidence_and_claims(self.profile(), [first, second])
+        self.assertEqual(len(built["claims"]), 1)
+        claim = built["claims"][0]
+        self.assertEqual(claim["state"], CLAIM_PUBLISHED)
+        self.assertEqual(claim["normalized_value"], 87.0)
+        self.assertEqual(len(claim["evidence_ids"]), 2)
+
+    def test_executor_accepted_observations_flow_into_the_claim_pipeline(self):
+        observation = self.observation(
+            name="Example AS",
+            source_url="https://www.example.no/about",
+            metrics={"rating": 4.5, "review_count": 87},
+        )
+        observation.pop("organisation_number", None)
+        task = mock_task(
+            connector="claim_connector",
+            company_name="Example AS",
+            extra={
+                "target_identity": {
+                    "organisation_number": "923609016",
+                    "name": "Example AS",
+                    "domain": "example.no",
+                    "address": {"street": "Karl Johans gate 1", "postcode": "0159", "city": "Oslo", "municipality": "OSLO"},
+                }
+            },
+        )
+        result = run_external_tasks(
+            [task],
+            registry=ConnectorRegistry([_ClaimingConnector(observation)]),
+            budget=RequestBudget(20),
+            now=self.now,
+        )
+        self.assertEqual(result["rejected_observations"], [])
+        self.assertEqual(len(result["observations"]), 1)
+        built = build_evidence_and_claims(self.profile(), result["observations"])
+        self.assertEqual(built["rejections"], [])
+        self.assertEqual({item["field"] for item in built["claims"]}, {"rating", "review_count"})
+        for claim in built["claims"]:
+            self.assertEqual(claim["state"], CLAIM_PUBLISHED)
+            self.assertEqual(claim["organisation_number"], "923609016")
+            self.assertEqual(claim["source_url"], "https://www.example.no/about")
+
+    def test_blocked_or_unverified_evidence_never_becomes_a_claim(self):
+        built = build_evidence_and_claims(self.profile(), [self.observation()])
+        record = built["evidence"][0]
+        self.assertEqual(len(assemble_claims([record], "923609016")), 2)
+        blocked = {**record, "status": "blocked"}
+        unverified = {**record, "identity": {**record["identity"], "status": "ambiguous"}}
+        mismatched = {**record, "identity": {**record["identity"], "status": "mismatched"}}
+        self.assertEqual(assemble_claims([blocked, unverified, mismatched], "923609016"), [])
+
+    def test_envelopes_with_claims_still_validate_as_terminal(self):
+        built = build_evidence_and_claims(self.profile(), [self.observation()])
+        profile = self.profile(external_claims=built["claims"])
+        envelopes = [
+            terminal_envelope(profile, run_id="run-1", modules=["registry"], started_at=self.now, completed_at=self.now)
+        ]
+        validation = validate_envelopes(envelopes, 1)
+        self.assertTrue(validation["passed"], validation)
+        self.assertEqual(validation["invalid_states"], [])
 
 
 if __name__ == "__main__":
